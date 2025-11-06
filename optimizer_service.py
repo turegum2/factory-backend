@@ -25,7 +25,7 @@ import mimetypes
 
 from starlette.staticfiles import StaticFiles
 
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, Body, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse, HTMLResponse
 
@@ -731,7 +731,7 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
     return df, metrics, tasks_all, resources, calendars, warnings, visible_breaks
 
 # --------- HTML-Гантт ---------
-def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=None, breaks=None, excel_url: Optional[str]=None) -> str:
+def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=None, breaks=None, excel_url: Optional[str]=None, base_url: Optional[str]=None) -> str:
     breaks = breaks or []
     # Базовые границы реального расписания
     start_min = min(t.start for t in tasks_all.values())
@@ -870,6 +870,7 @@ def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=
     html = f"""
 <!doctype html>
 <html lang="ru"><head><meta charset="utf-8"/>
+{f'<base href="{base_url}/">' if base_url else ''}
 <title>Производственный план</title>
 <style>
 :root {{ --label-w: {label_w}px; }}
@@ -1030,7 +1031,7 @@ def optimize_html(payload: dict = Body(...)):
     return HTMLResponse(html)
 
 @app.post("/optimize/html-file")
-def optimize_html_file(payload: dict = Body(...)):
+def optimize_html_file(payload: dict = Body(...), request: Request):
     # 1) Считаем план
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(
@@ -1055,9 +1056,15 @@ def optimize_html_file(payload: dict = Body(...)):
 
     # 4) Формируем финальный HTML уже со ссылкой на Excel и сохраняем (атомарно)
     ts = str(int(time.time() * 1000))
-    excel_url = f"/download/schedule.xlsx?ts={ts}"
+
+    # База для абсолютных ссылок (за шлюзом)
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host   = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    base_url = f"{scheme}://{host}"
+
+    excel_url = f"{base_url}/download/schedule.xlsx?ts={ts}"
     html = build_gantt_html(tasks_all, resources, calendars, warnings,
-                            breaks=chosen_breaks, excel_url=excel_url)
+                            breaks=chosen_breaks, excel_url=excel_url, base_url=base_url)
 
     target_html = str(UI_DIR / "gantt_schedule.html")
     with tempfile.NamedTemporaryFile("w", delete=False, dir=str(UI_DIR), suffix=".tmp", encoding="utf-8") as tmp:
