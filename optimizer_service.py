@@ -1031,7 +1031,7 @@ def optimize_html(payload: dict = Body(...)):
     return HTMLResponse(html)
 
 @app.post("/optimize/html-file")
-def optimize_html_file(payload: dict = Body(...), request: Request):
+def optimize_html_file(request: Request, payload: dict = Body(...)):
     # 1) Считаем план
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(
