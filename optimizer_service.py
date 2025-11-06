@@ -861,7 +861,7 @@ def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=
 
     footer_html = (f'''
       <div style="margin-top:16px">
-        <a href="{excel_url}" download="schedule.xlsx" rel="noopener">Скачать Excel</a>
+        <a id="dl-excel" href="{excel_url}" download="schedule.xlsx" rel="noopener">Скачать Excel</a>
         <div class="small">Будьте внимательны - здесь ссылка на последний расчёт (файл перезаписывается).</div>
       </div>
     ''' if excel_url else '')
@@ -978,6 +978,17 @@ th {{ background:#fafafa; }}
     function sync(from, to){{ if (lock) return; lock = true; to.scrollLeft = from.scrollLeft; lock = false; }}
     head.addEventListener('scroll', ()=>sync(head, body));
     body.addEventListener('scroll', ()=>sync(body, head));
+  </script>
+  <script>
+    (function () {
+      try {
+        var u = new URL(window.location.href);
+        if (u.searchParams.get('dl') === '1') {
+          var link = document.getElementById('dl-excel');
+          if (link) setTimeout(function(){ link.click(); }, 0);
+        }
+      } catch(e) {}
+    })();
   </script>
 </body></html>
 """
