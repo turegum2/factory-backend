@@ -1,0 +1,51 @@
+name: Deploy backend to Yandex Serverless Containers
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "optimizer_service.py"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/deploy-back.yml"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC для WIF
+      contents: read
+    env:
+      YC_REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}         # ID реестра (crp...)
+      CR_REPOSITORY:  ${{ vars.CR_REPOSITORY || 'optimizer-back' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Yandex Cloud Container Registry (OIDC)
+        uses: yc-actions/yc-cr-login@v3
+        with:
+          yc-sa-id: ${{ secrets.YC_SA_ID }}   # CI-SA, привязанный к федерации
+
+      - name: Compute image ref
+        run: |
+          echo "IMAGE=cr.yandex/${{ env.YC_REGISTRY_ID }}/${{ env.CR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Build & push image to Yandex CR
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy Serverless Container
+        uses: yc-actions/yc-sls-container-deploy@v4
+        with:
+          yc-sa-id: ${{ secrets.YC_SA_ID }}                 # тот же CI-SA по WIF
+          folder-id: ${{ secrets.YC_FOLDER_ID }}
+          container-name: optimizer-back                    # создаст контейнер, если нет
+          revision-image-url: ${{ env.IMAGE }}
+          revision-cores: 1
+          revision-memory: 512Mb
+          revision-concurrency: 16
+          # если отдельного runtime SA пока нет — можно опустить строку ниже,
+          # либо оставить подстановку:
+          revision-service-account-id: ${{ secrets.YC_RUNTIME_SA_ID || secrets.YC_SA_ID }}
