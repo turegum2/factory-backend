@@ -48,7 +48,4 @@ jobs:
           revision-concurrency: 1
           revision-cores: 1
           revision-memory: 512Mb
-          revision-concurrency: 16
-          # если отдельного runtime SA пока нет — можно опустить строку ниже,
-          # либо оставить подстановку:
           revision-service-account-id: ${{ secrets.YC_RUNTIME_SA_ID || secrets.YC_SA_ID }}
