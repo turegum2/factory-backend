@@ -21,12 +21,13 @@ import tempfile
 import math
 import io
 import time
+import mimetypes
 
 from starlette.staticfiles import StaticFiles
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse, HTMLResponse
 
 import pandas as pd
 
@@ -860,7 +861,7 @@ def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=
 
     footer_html = (f'''
       <div style="margin-top:16px">
-        <a href="{excel_url}" download>Скачать Excel</a>
+        <a href="{excel_url}" download="schedule.xlsx" rel="noopener">Скачать Excel</a>
         <div class="small">Будьте внимательны - здесь ссылка на последний расчёт (файл перезаписывается).</div>
       </div>
     ''' if excel_url else '')
@@ -988,6 +989,8 @@ UI_DIR = Path(__file__).parent / "frontend"
 UI_DIR.mkdir(parents=True, exist_ok=True)  # гарантируем наличие каталога
 app.mount("/ui", NoCacheStaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
+mimetypes.add_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # сузить в проде
@@ -1052,7 +1055,7 @@ def optimize_html_file(payload: dict = Body(...)):
 
     # 4) Формируем финальный HTML уже со ссылкой на Excel и сохраняем (атомарно)
     ts = str(int(time.time() * 1000))
-    excel_url = f"/ui/schedule.xlsx?ts={ts}"
+    excel_url = f"/download/schedule.xlsx?ts={ts}"
     html = build_gantt_html(tasks_all, resources, calendars, warnings,
                             breaks=chosen_breaks, excel_url=excel_url)
 
@@ -1068,3 +1071,14 @@ def optimize_html_file(payload: dict = Body(...)):
         "url": f"/ui/gantt_schedule.html?ts={ts}",
         "excel_url": excel_url
     })
+
+@app.get("/download/schedule.xlsx")
+def download_schedule():
+    path = UI_DIR / "schedule.xlsx"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Excel not generated")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="schedule.xlsx",
+    )

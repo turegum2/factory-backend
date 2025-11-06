@@ -46,6 +46,7 @@ jobs:
           revision-port: 8080
           revision-execution-timeout: 120
           revision-concurrency: 1
-          revision-cores: 1
-          revision-memory: 512Mb
+          revision-cores: 2
+          revision-core-fraction: 100
+          revision-memory: 1024Mb
           revision-service-account-id: ${{ secrets.YC_RUNTIME_SA_ID || secrets.YC_SA_ID }}
