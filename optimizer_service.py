@@ -1038,7 +1038,7 @@ def optimize_html_file(payload: dict = Body(...)):
     )
 
     # 2) Готовим папку
-    os.makedirs("frontend", exist_ok=True)
+    UI_DIR.mkdir(parents=True, exist_ok=True)
 
     # 3) Сохраняем Excel (атомарно)
     out = io.BytesIO()
@@ -1047,8 +1047,8 @@ def optimize_html_file(payload: dict = Body(...)):
         if warnings:
             pd.DataFrame(warnings).to_excel(writer, index=False, sheet_name="Validation")
     out.seek(0)
-    target_xlsx = os.path.join("frontend", "schedule.xlsx")
-    with tempfile.NamedTemporaryFile("wb", delete=False, dir="frontend", suffix=".tmp") as tmp:
+    target_xlsx = str(UI_DIR / "schedule.xlsx")
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(UI_DIR), suffix=".tmp") as tmp:
         tmp.write(out.getvalue())
         tmp_xlsx = tmp.name
     os.replace(tmp_xlsx, target_xlsx)
@@ -1059,8 +1059,8 @@ def optimize_html_file(payload: dict = Body(...)):
     html = build_gantt_html(tasks_all, resources, calendars, warnings,
                             breaks=chosen_breaks, excel_url=excel_url)
 
-    target_html = os.path.join("frontend", "gantt_schedule.html")
-    with tempfile.NamedTemporaryFile("w", delete=False, dir="frontend", suffix=".tmp", encoding="utf-8") as tmp:
+    target_html = str(UI_DIR / "gantt_schedule.html")
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(UI_DIR), suffix=".tmp", encoding="utf-8") as tmp:
         tmp.write(html)
         tmp_html = tmp.name
     os.replace(tmp_html, target_html)
@@ -1069,7 +1069,8 @@ def optimize_html_file(payload: dict = Body(...)):
     return JSONResponse({
         "ok": True,
         "url": f"/ui/gantt_schedule.html?ts={ts}",
-        "excel_url": excel_url
+        "excel_url": excel_url,
+        "html": html
     })
 
 @app.get("/download/schedule.xlsx")

@@ -46,6 +46,7 @@ jobs:
           revision-port: 8080
           revision-execution-timeout: 120
           revision-concurrency: 1
+          revision-min-instances: 1
           revision-cores: 2
           revision-core-fraction: 100
           revision-memory: 1024Mb
