@@ -15,6 +15,7 @@ API не менялся:
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
+from pathlib import Path
 import os
 import tempfile
 import math
@@ -983,7 +984,9 @@ th {{ background:#fafafa; }}
 # --------- FastAPI ---------
 app = FastAPI(title="Production Optimizer (CP-SAT)", version="2.0.0")
 
-app.mount("/ui", NoCacheStaticFiles(directory="frontend", html=True), name="ui")
+UI_DIR = Path(__file__).parent / "frontend"
+UI_DIR.mkdir(parents=True, exist_ok=True)  # гарантируем наличие каталога
+app.mount("/ui", NoCacheStaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
 app.add_middleware(
     CORSMiddleware,

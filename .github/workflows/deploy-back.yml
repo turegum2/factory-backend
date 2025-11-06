@@ -43,6 +43,7 @@ jobs:
           folder-id: ${{ secrets.YC_FOLDER_ID }}
           container-name: optimizer-back                    # создаст контейнер, если нет
           revision-image-url: ${{ env.IMAGE }}
+          revision-port: 8080
           revision-cores: 1
           revision-memory: 512Mb
           revision-concurrency: 16
