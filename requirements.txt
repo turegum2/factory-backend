@@ -4,3 +4,4 @@ pandas
 openpyxl
 ortools
 aiofiles
+boto3

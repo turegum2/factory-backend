@@ -22,6 +22,8 @@ import math
 import io
 import time
 import mimetypes
+import uuid
+import boto3
 
 from starlette.staticfiles import StaticFiles
 
@@ -33,6 +35,31 @@ import pandas as pd
 
 # --- OR-Tools ---
 from ortools.sat.python import cp_model
+
+# --------- Всякие S3 штуки -----------------
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "https://storage.yandexcloud.net")
+S3_REGION   = os.getenv("S3_REGION", "ru-central1")
+S3_BUCKET   = os.getenv("S3_BUCKET", "optimizer-ui") # обязателен
+S3_PREFIX   = os.getenv("S3_PREFIX", "prod/") # можно пустым
+PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "86400"))
+
+_s3 = boto3.client(
+    "s3",
+    endpoint_url=S3_ENDPOINT,
+    region_name=S3_REGION,
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+)
+
+def _s3_put(key: str, data: bytes, ctype: str, cache="no-store"):
+    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
+                   ContentType=ctype, CacheControl=cache)
+
+def _s3_presigned(key: str, filename: str | None = None) -> str:
+    params = {"Bucket": S3_BUCKET, "Key": key}
+    if filename:
+        params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
+    return _s3.generate_presigned_url("get_object", Params=params, ExpiresIn=PRESIGN_TTL)
 
 # --------- Константы ресурсов и смен ---------
 OP = "Оператор"
@@ -57,16 +84,6 @@ OP_FLEX_BREAKS = [
     (13 * 60, 14 * 60, 30),
     (15 * 60, 16 * 60, 15),
 ]
-
-# -------- Анти-кеш для главной страницы -----------
-class NoCacheStaticFiles(StaticFiles):
-    async def get_response(self, path, scope):
-        resp = await super().get_response(path, scope)
-        if path in ("", "index.html"):  # только стартовая страница
-            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-            resp.headers["Pragma"] = "no-cache"
-            resp.headers["Expires"] = "0"
-        return resp
 
 # --------- Модель задачи ---------
 @dataclass
@@ -981,13 +998,14 @@ th {{ background:#fafafa; }}
   </script>
   <script>
     (function () {{
-      try {{
-        var u = new URL(window.location.href);
-        if (u.searchParams.get('dl') === '1') {{
-          var link = document.getElementById('dl-excel');
-          if (link) setTimeout(function(){{ link.click(); }}, 0);
-        }}
-      }} catch(e) {{}}
+        try {{
+          var u = new URL(window.location.href);
+          var want = u.searchParams.get('dl') === '1' || (window.location.hash || '').indexOf('dl=1') >= 0;
+          if (want) {{
+            var link = document.getElementById('dl-excel');
+            if (link) setTimeout(function(){{ link.click(); }}, 0);
+          }}
+        }} catch(e) {{}}
     }})();
   </script>
 </body></html>
@@ -996,10 +1014,6 @@ th {{ background:#fafafa; }}
 
 # --------- FastAPI ---------
 app = FastAPI(title="Production Optimizer (CP-SAT)", version="2.0.0")
-
-UI_DIR = Path(__file__).parent / "frontend"
-UI_DIR.mkdir(parents=True, exist_ok=True)  # гарантируем наличие каталога
-app.mount("/ui", NoCacheStaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
 
@@ -1011,17 +1025,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return RedirectResponse(url=f"/ui")
-
 @app.get("/ping")
 def ping():
     return {"ok": True}
-
-@app.get("/favicon.ico")
-def fav():
-    return RedirectResponse(url="/ui/favicon.ico")
 
 def schedule(orders, deliveries, stones, sawPrograms, details, policy):
     """Совместимость со старым API — теперь вызывает CP-SAT оптимизатор."""
@@ -1042,62 +1048,37 @@ def optimize_html(payload: dict = Body(...)):
     return HTMLResponse(html)
 
 @app.post("/optimize/html-file")
-def optimize_html_file(request: Request, payload: dict = Body(...)):
-    # 1) Считаем план
+def optimize_html_file(payload: dict = Body(...)):
+    # 1) расчет
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(
         orders, deliveries, stones, sawPrograms, details, policy
     )
 
-    # 2) Готовим папку
-    UI_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 3) Сохраняем Excel (атомарно)
+    # 2) Excel -> bytes
     out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Schedule")
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Schedule")
         if warnings:
-            pd.DataFrame(warnings).to_excel(writer, index=False, sheet_name="Validation")
+            pd.DataFrame(warnings).to_excel(w, index=False, sheet_name="Validation")
     out.seek(0)
-    target_xlsx = str(UI_DIR / "schedule.xlsx")
-    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(UI_DIR), suffix=".tmp") as tmp:
-        tmp.write(out.getvalue())
-        tmp_xlsx = tmp.name
-    os.replace(tmp_xlsx, target_xlsx)
+    xlsx_bytes = out.getvalue()
 
-    # 4) Формируем финальный HTML уже со ссылкой на Excel и сохраняем (атомарно)
-    ts = str(int(time.time() * 1000))
+    # 3) ключи в бакете
+    calc_id  = f"{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
+    xlsx_key = f"{S3_PREFIX}schedules/{calc_id}.xlsx"
+    html_key = f"{S3_PREFIX}reports/{calc_id}.html"
 
-    # База для абсолютных ссылок (за шлюзом)
-    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host   = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    base_url = f"{scheme}://{host}"
+    # 4) загрузка в S3
+    _s3_put(xlsx_key, xlsx_bytes,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    excel_url = _s3_presigned(xlsx_key, filename="schedule.xlsx")
 
-    excel_url = f"{base_url}/download/schedule.xlsx?ts={ts}"
     html = build_gantt_html(tasks_all, resources, calendars, warnings,
-                            breaks=chosen_breaks, excel_url=excel_url, base_url=base_url)
+                            breaks=chosen_breaks, excel_url=excel_url, base_url=None)
+    _s3_put(html_key, html.encode("utf-8"), "text/html; charset=utf-8")
 
-    target_html = str(UI_DIR / "gantt_schedule.html")
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(UI_DIR), suffix=".tmp", encoding="utf-8") as tmp:
-        tmp.write(html)
-        tmp_html = tmp.name
-    os.replace(tmp_html, target_html)
+    html_url = _s3_presigned(html_key)
 
-    # 5) Отдаём ссылки (HTML с cache-buster и Excel)
-    return JSONResponse({
-        "ok": True,
-        "url": f"/ui/gantt_schedule.html?ts={ts}",
-        "excel_url": excel_url,
-        "html": html
-    })
-
-@app.get("/download/schedule.xlsx")
-def download_schedule():
-    path = UI_DIR / "schedule.xlsx"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Excel not generated")
-    return FileResponse(
-        path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="schedule.xlsx",
-    )
+    # 5) отдаем ссылки (html_html оставляем для дебага/резерва)
+    return JSONResponse({"ok": True, "html_url": html_url, "excel_url": excel_url, "html": html})
