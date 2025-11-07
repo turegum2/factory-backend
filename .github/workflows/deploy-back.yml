@@ -39,18 +39,18 @@ jobs:
       - name: Deploy Serverless Container
         uses: yc-actions/yc-sls-container-deploy@v4
         with:
-          yc-sa-id: ${{ secrets.YC_SA_ID }}                 # тот же CI-SA по WIF
+          yc-sa-id: ${{ secrets.YC_SA_ID }}
           folder-id: ${{ secrets.YC_FOLDER_ID }}
-          container-name: optimizer-back                    # создаст контейнер, если нет
+          container-name: optimizer-back
           revision-image-url: ${{ env.IMAGE }}
           revision-port: 8080
-          revision-execution-timeout: 120
+          revision-execution-timeout: 300
           revision-concurrency: 1
           revision-min-instances: 1
           revision-cores: 2
           revision-core-fraction: 100
           revision-memory: 1024Mb
-          revision-service-account-id: ${{ secrets.YC_RUNTIME_SA_ID || secrets.YC_SA_ID }}
+          revision-service-account-id: ${{ secrets.YC_SA_ID }}
           revision-env: |
             S3_BUCKET=${{ vars.S3_BUCKET }}
             S3_PREFIX=${{ vars.S3_PREFIX }}
