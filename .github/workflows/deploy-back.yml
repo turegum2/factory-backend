@@ -46,7 +46,7 @@ jobs:
           revision-port: 8080
           revision-execution-timeout: 300
           revision-concurrency: 1
-          revision-min-instances: 1
+          revision-min-instances: 2
           revision-cores: 2
           revision-core-fraction: 100
           revision-memory: 1024Mb
@@ -59,3 +59,16 @@ jobs:
             PRESIGN_TTL=${{ vars.S3_PRESIGN_TTL }}
             AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
             AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: Warm up new revision
+        run: |
+          set -e
+          URL="${{ vars.API_BASE }}/ping"
+          for i in {1..90}; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "Warm OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Warm-up failed"; exit 1
