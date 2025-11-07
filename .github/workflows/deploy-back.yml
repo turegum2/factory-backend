@@ -46,8 +46,16 @@ jobs:
           revision-port: 8080
           revision-execution-timeout: 120
           revision-concurrency: 1
-          revision-min-instances: 1
+          revision-provision-policy-min-instances: 1
           revision-cores: 2
           revision-core-fraction: 100
           revision-memory: 1024Mb
           revision-service-account-id: ${{ secrets.YC_RUNTIME_SA_ID || secrets.YC_SA_ID }}
+          revision-env: |
+            S3_BUCKET=${{ vars.S3_BUCKET }}
+            S3_PREFIX=${{ vars.S3_PREFIX }}            # напр. prod/reports/
+            S3_REGION=${{ vars.S3_REGION }}            # ru-central1
+            S3_ENDPOINT=${{ vars.S3_ENDPOINT }}        # https://storage.yandexcloud.net
+            PRESIGN_TTL=${{ vars.S3_PRESIGN_TTL }}
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
