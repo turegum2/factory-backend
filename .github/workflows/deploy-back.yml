@@ -61,13 +61,21 @@ jobs:
             AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
       
       - name: Warm up new revision
+        env:
+          API_BASE: ${{ vars.API_BASE }}
         run: |
           set -e
-          URL="${{ vars.API_BASE }}/ping"
+          URL="${API_BASE%/}/ping"
+          echo "Warming $URL"
           for i in {1..90}; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$URL" || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$URL" || echo "000")
+            echo "try $i -> $code"
             if [ "$code" = "200" ]; then
               echo "Warm OK"; exit 0
+            fi
+            # Если стабильно 404 — значит нет маршрута /ping в API GW
+            if [ "$code" = "404" ]; then
+              echo "Ping path is 404 on API Gateway — add GET /ping route to the container"; exit 1
             fi
             sleep 2
           done
