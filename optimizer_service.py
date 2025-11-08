@@ -15,9 +15,7 @@ API не менялся:
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
-from pathlib import Path
 import os
-import tempfile
 import math
 import io
 import time
@@ -25,11 +23,9 @@ import mimetypes
 import uuid
 import boto3
 
-from starlette.staticfiles import StaticFiles
-
-from fastapi import FastAPI, Body, HTTPException, Request
+from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, RedirectResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 import pandas as pd
 
@@ -352,6 +348,19 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
         model.Add(sum(lits) == 1)
         model.Add(e == s + dur)
 
+    def constrain_to_operator_day_multi_conditional(model, s, e, dur, DAYS, lit):
+        """Как constrain_to_operator_day_multi, но действует только при lit=1."""
+        day_bits = []
+        for d in range(DAYS):
+            b = model.NewBoolVar(f"op_{s.Name()}_{d}")
+            model.Add(s >= d * DAY + DAY_BEG).OnlyEnforceIf(b)
+            model.Add(e <= d * DAY + DAY_END).OnlyEnforceIf(b)
+            day_bits.append(b)
+        # если lit=0, ни один день не выбран; если lit=1 — выбран ровно один
+        model.Add(sum(day_bits) == lit)
+        # длительность фиксируем только когда интервал "включён"
+        model.Add(e == s + dur).OnlyEnforceIf(lit)
+
     # Накопим интервалы по ресурсам
     op_intervals: List[cp_model.IntervalVar] = []
     machine_blocks: Dict[str, List[cp_model.IntervalVar]] = defaultdict(list)
@@ -421,27 +430,70 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
         sP, eP = starts[pid], ends[pid]
         sU, eU = starts[uid], ends[uid]
 
-        # Фиксированные связи внутри бандла
-        # LOAD: операторское окно
-        constrain_to_operator_day_multi(model, sL, eL, tL.duration, DAYS)
-        # PROC: только машина, «привязываем» к концу LOAD
-        model.Add(sP == eL)
-        model.Add(eP == sP + tP.duration)
-        # UNLOAD: операторское окно, не раньше конца PROC
-        constrain_to_operator_day_multi(model, sU, eU, tU.duration, DAYS)
-        model.Add(sU >= eP)
+        if M == SAW:
+            # --- ПИЛА: без изменений — "положить" всегда учитываем как задано ---
+            # LOAD: операторское окно (фиксированная длительность)
+            constrain_to_operator_day_multi(model, sL, eL, tL.duration, DAYS)
+            # PROC: только машина, "привязываем" к концу LOAD
+            model.Add(sP == eL)
+            model.Add(eP == sP + tP.duration)
+            # UNLOAD: операторское окно, не раньше конца PROC
+            constrain_to_operator_day_multi(model, sU, eU, tU.duration, DAYS)
+            model.Add(sU >= eP)
 
-        # Оп. интервалы для OP
-        ivL = model.NewIntervalVar(sL, tL.duration, eL, f"iv_{lid}")
-        ivU = model.NewIntervalVar(sU, tU.duration, eU, f"iv_{uid}")
-        ivals[lid] = ivL; ivals[uid] = ivU
+            # Интервалы оператора
+            ivL = model.NewIntervalVar(sL, tL.duration, eL, f"iv_{lid}")
+            ivU = model.NewIntervalVar(sU, tU.duration, eU, f"iv_{uid}")
+
+        else:
+            # --- КРОМКА/ФРЕЗЕРЫ: "положить" опционально (0 мин при мгновенной передаче) ---
+
+            # Конец предшествующей операции (обычно UNLOAD предыдущего станка/пилы)
+            preds = tasks_all[lid].preds
+            if len(preds) == 1:
+                pEnd = ends[preds[0]]
+            else:
+                pEnd = model.NewIntVar(H_BEG, H_END, f"pEnd_{lid}")
+                model.AddMaxEquality(pEnd, [ends[p] for p in preds])
+
+            # Булева: учитывать ли "положить" (1 — была задержка, 0 — мгновенная передача)
+            use_load = model.NewBoolVar(f"use_load_{lid}")
+
+            # Окно оператора и фиксирование длительности включаем ТОЛЬКО когда use_load=1
+            constrain_to_operator_day_multi_conditional(model, sL, eL, tL.duration, DAYS, use_load)
+
+            # Мгновенная передача: старт ровно в pEnd, длительность 0
+            model.Add(sL == pEnd).OnlyEnforceIf(use_load.Not())
+            model.Add(eL == sL).OnlyEnforceIf(use_load.Not())
+
+            # Было ожидание (станок был занят): старт позже pEnd, длительность — входная
+            model.Add(sL >= pEnd + 1).OnlyEnforceIf(use_load)
+            model.Add(eL == sL + tL.duration).OnlyEnforceIf(use_load)
+
+            # PROC: "привязываем" к концу LOAD (работает и при eL == sL)
+            model.Add(sP == eL)
+            model.Add(eP == sP + tP.duration)
+
+            # UNLOAD: операторское окно, не раньше конца PROC
+            constrain_to_operator_day_multi(model, sU, eU, tU.duration, DAYS)
+            model.Add(sU >= eP)
+
+            # Интервалы оператора: LOAD только если реально тратили время; UNLOAD — всегда
+            ivL = model.NewOptionalIntervalVar(sL, tL.duration, eL, use_load, f"iv_{lid}")
+            ivU = model.NewIntervalVar(sU, tU.duration, eU, f"iv_{uid}")
+
+        # Сохраняем интервалы оператора
+        ivals[lid] = ivL
+        ivals[uid] = ivU
         op_intervals += [ivL, ivU]
 
-        # Машинный блок: [sL, eU) — непрерывная занятость машины
-        block_dur = model.NewIntVar(tL.duration + tP.duration + tU.duration, (H_END - H_BEG), f"dur_block_{lid}")
+        # Машинный блок: непрерывная занятость машины [sL, eU)
+        # Нижнюю границу ослабляем до 0 — чтобы допустить "положить = 0"
+        block_dur = model.NewIntVar(0, H_END - H_BEG, f"dur_block_{lid}")
         model.Add(block_dur == (eU - sL))
         block = model.NewIntervalVar(sL, block_dur, eU, f"blk_{lid}")
-        stone_id = tasks_all[lid].ref_id  # ВАЖНО: брать именно здесь, чтобы не ловить "остаточное" значение
+
+        stone_id = tasks_all[lid].ref_id  # важно брать именно здесь
         if not (M == SAW and stone_id in stones_with_megablock):
             machine_blocks[M].append(block)
 
@@ -698,7 +750,7 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
             "День": int(day_no),
             "Время начала": hhmm(t.start),
             "Время окончания": hhmm(t.end),
-            "Длительность (мин)": int(t.duration),
+            "Длительность (мин)": int(max(0, t.end - t.start)),
             "Номер заказа": order_for_row,
             "ID": display_id(t),
             "Элемент": "доставка" if t.label == "Доставка"
@@ -814,13 +866,14 @@ def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=
     for uid in view_order:
         t = tasks_all[uid]
         left = int((vis_offset(t.start) - base_vis) * px_per_min)
-        w = max(2, int(t.duration * px_per_min))
+        actual = max(0, t.end - t.start)
+        w = max(2, int(actual * px_per_min))
         color = "#3d85c6" if t.resources[0] == OP else "#6aa84f"
         label_text = f"{display_id(t)} {t.label}"
         label_rows.append(f'<div class="label-row" title="{label_text}">{label_text}</div>')
         track_rows.append(
             f'<div class="track-row"><div class="bar" style="left:{left}px;width:{w}px;background:{color}" '
-            f'title="{label_text} ({t.duration} мин, {t.resources[0]})"></div></div>'
+            f'title="{label_text} ({actual} мин, {t.resources[0]})"></div></div>'
         )
 
     # Часовые метки (09–18), грид-линии, обед и ярлыки дней
@@ -861,8 +914,9 @@ def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=
     # Загрузка ресурсов (как раньше)
     busy = {r: 0 for r in resources}
     for t in tasks_all.values():
+        actual = max(0, t.end - t.start)
         for r in t.resources:
-            busy[r] += t.duration
+            busy[r] += actual
     util_rows = []
     for r in sorted(resources):
         avail = available_minutes(calendars[r], start_min, end_min)
