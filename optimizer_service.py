@@ -15,6 +15,7 @@ API не менялся:
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
+import re
 import os
 import math
 import io
@@ -150,24 +151,24 @@ def create_access_token(username: str, role: str) -> tuple[str, int]:
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)) -> dict:
     if credentials is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Не авторизован")
     token = credentials.credentials
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Сессия истекла")
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный токен")
 
     username = payload.get("sub")
     role = payload.get("role")
     if not username or not role:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверное содержимое токена")
 
     users = _load_users()
     user = users.get(username)
     if not user or not user.get("is_active", True):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Пользователь деактивирован")
     return {
         "username": username,
         "role": role,
@@ -177,12 +178,12 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(auth_sc
 def require_active_user(user: dict = Depends(get_current_user)) -> dict:
     if user.get("must_change_password"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Password change required")
+                            detail="Необходимо сменить пароль")
     return user
 
 def require_admin(user: dict = Depends(require_active_user)) -> dict:
     if user["role"] != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Может сделать только admin")
     return user
 
  # --------- Константы ресурсов и смен ---------
@@ -1233,7 +1234,6 @@ class UserOut(BaseModel):
 class UserCreate(BaseModel):
     username: str
     password: str
-    role: str = "user"
 
 class UserUpdate(BaseModel):
     password: str | None = None
@@ -1315,9 +1315,9 @@ def login(req: LoginRequest):
     users = _load_users()
     user = users.get(req.username)
     if not user or not user.get("is_active", True):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Неверное имя пользователя или пароль")
     if not verify_password(req.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Неверное имя пользователя или пароль")
 
     token, exp = create_access_token(user["username"], user["role"])
     return LoginResponse(
@@ -1355,36 +1355,60 @@ def list_users(_: dict = Depends(require_admin)):
         for u in users.values()
     ]
 
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
 @app.post("/users", response_model=UserOut)
 def create_user(payload: UserCreate, _: dict = Depends(require_admin)):
     users = _load_users()
-    if payload.username in users:
-        raise HTTPException(status_code=400, detail="Username already exists")
 
-    if payload.role not in ("admin", "user"):
-        raise HTTPException(status_code=400, detail="Invalid role")
+    username = payload.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Требуется указать имя пользователя")
 
-    users[payload.username] = {
-        "username": payload.username,
+    if not USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=400,
+            detail="Имя пользователя может содержать только латинские буквы и символы ._-",
+        )
+
+    if username in users:
+        raise HTTPException(status_code=400, detail="Такое имя пользователя уже существует")
+
+    if CYRILLIC_RE.search(payload.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Пароль не может содержать русские буквы",
+        )
+
+    users[username] = {
+        "username": username,
         "password_hash": hash_password(payload.password),
-        "role": payload.role,
+        "role": "user",                    # админ создаёт только обычных пользователей
         "is_active": True,
-        "must_change_password": True,   # ← временный пароль, обязателен к смене
+        "must_change_password": True,      # при первом входе заставим сменить
         "created_at": dt.datetime.utcnow().isoformat() + "Z",
     }
     _save_users(users)
     return UserOut(
-        username=payload.username,
-        role=payload.role,
+        username=username,
+        role="user",
         is_active=True,
-        created_at=users[payload.username]["created_at"],
+        created_at=users[username]["created_at"],
     )
 
 @app.put("/users/{username}", response_model=UserOut)
 def update_user(username: str, payload: UserUpdate, admin=Depends(require_admin)):
     users = _load_users()
     if username not in users:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Пользователь не найдет")
+
+    # Базового admin нельзя понизить или выключить
+    if username == AUTH_BOOTSTRAP_ADMIN_LOGIN:
+        if payload.role is not None and payload.role != "admin":
+            raise HTTPException(status_code=400, detail="Нельзя поменнять роль учетной записи admin")
+        if payload.is_active is False:
+            raise HTTPException(status_code=400, detail="Нельзя деактивировать учетную запись admin")
 
     user = users[username]
 
@@ -1394,14 +1418,14 @@ def update_user(username: str, payload: UserUpdate, admin=Depends(require_admin)
             other_admins = [u for u in users.values()
                             if u["username"] != username and u["role"] == "admin" and u.get("is_active", True)]
             if not other_admins:
-                raise HTTPException(status_code=400, detail="Cannot demote/disable last admin")
+                raise HTTPException(status_code=400, detail="Нельзя деактивировать последнего admin")
 
     if payload.password:
         user["password_hash"] = hash_password(payload.password)
         user["must_change_password"] = True  # ← при сбросе пароля заставляем сменить
     if payload.role:
         if payload.role not in ("admin", "user"):
-            raise HTTPException(status_code=400, detail="Invalid role")
+            raise HTTPException(status_code=400, detail="Неверная роль")
         user["role"] = payload.role
     if payload.is_active is not None:
         user["is_active"] = payload.is_active
@@ -1419,14 +1443,18 @@ def update_user(username: str, payload: UserUpdate, admin=Depends(require_admin)
 def delete_user(username: str, admin=Depends(require_admin)):
     users = _load_users()
     if username not in users:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    # Нельзя удалять встроенного админа
+    if username == AUTH_BOOTSTRAP_ADMIN_LOGIN:
+        raise HTTPException(status_code=400, detail="Учетная запись admin не может быть удалена")
 
     user = users[username]
     if user["role"] == "admin":
         other_admins = [u for u in users.values()
                         if u["username"] != username and u["role"] == "admin" and u.get("is_active", True)]
         if not other_admins:
-            raise HTTPException(status_code=400, detail="Cannot delete last admin")
+            raise HTTPException(status_code=400, detail="Нельзя удалить последнюю учетную запись admin")
 
     del users[username]
     _save_users(users)
@@ -1437,13 +1465,13 @@ def change_password(payload: PasswordChange, current=Depends(get_current_user)):
     users = _load_users()
     user = users.get(current["username"])
     if not user or not user.get("is_active", True):
-        raise HTTPException(status_code=401, detail="User not found or inactive")
+        raise HTTPException(status_code=401, detail="Пользователь не найден, либо неактивен")
 
     if not verify_password(payload.old_password, user["password_hash"]):
-        raise HTTPException(status_code=400, detail="Wrong current password")
+        raise HTTPException(status_code=400, detail="Неверный пароль")
 
     if len(payload.new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password too short")
+        raise HTTPException(status_code=400, detail="Пароль слишком короткий (нужно от 8 символов)")
 
     user["password_hash"] = hash_password(payload.new_password)
     user["must_change_password"] = False
