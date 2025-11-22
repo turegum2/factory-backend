@@ -173,7 +173,6 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(auth_sc
         "role": role,
         "must_change_password": bool(user.get("must_change_password", False)),
     }
-    return {"username": username, "role": role}
 
 def require_active_user(user: dict = Depends(get_current_user)) -> dict:
     if user.get("must_change_password"):
