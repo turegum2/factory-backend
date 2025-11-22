@@ -46,6 +46,7 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT", "https://storage.yandexcloud.net")
 S3_REGION = os.getenv("S3_REGION", "ru-central1")
 S3_BUCKET = os.getenv("S3_BUCKET", "optimizer-ui")
 S3_PREFIX = os.getenv("S3_PREFIX", "prod/")
+USERS_S3_PREFIX = os.getenv("USERS_S3_PREFIX", "users/")
 PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "86400"))
 
 # --------- Доступ -----------------
@@ -55,7 +56,7 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
     raise RuntimeError("JWT_SECRET env var JWT_SECRET is not set")
 
-USERS_S3_KEY = os.getenv("USERS_S3_KEY", f"{S3_PREFIX}auth/users.json")
+USERS_S3_KEY = os.getenv("USERS_S3_KEY", f"{USERS_S3_PREFIX}auth/users.json")
 AUTH_BOOTSTRAP_ADMIN_LOGIN = os.getenv("AUTH_BOOTSTRAP_ADMIN_LOGIN", "admin")
 AUTH_BOOTSTRAP_ADMIN_PASSWORD = os.getenv("AUTH_BOOTSTRAP_ADMIN_PASSWORD", "admin")
 
