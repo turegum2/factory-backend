@@ -34,9 +34,9 @@ from ortools.sat.python import cp_model
 
 # --------- Всякие S3 штуки -----------------
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "https://storage.yandexcloud.net")
-S3_REGION   = os.getenv("S3_REGION", "ru-central1")
-S3_BUCKET   = os.getenv("S3_BUCKET", "optimizer-ui") # обязателен
-S3_PREFIX   = os.getenv("S3_PREFIX", "prod/") # можно пустым
+S3_REGION = os.getenv("S3_REGION", "ru-central1")
+S3_BUCKET = os.getenv("S3_BUCKET", "optimizer-ui")  # обязателен
+S3_PREFIX = os.getenv("S3_PREFIX", "prod/")  # можно пустым
 PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "86400"))
 
 _s3 = boto3.client(
@@ -106,14 +106,17 @@ def build_runtime(obj: dict):
 
     stones: Dict[str, dict] = {}
     for s in obj.get("stones", []):
-        sid = str(s["stone_id"]); oid = str(s["order_id"]); did = str(s.get("delivery_id") or "")
+        sid = str(s["stone_id"])
+        oid = str(s["order_id"])
+        did = str(s.get("delivery_id") or "")
         stones[sid] = {"id": sid, "orderId": oid, "deliveryId": did, "sawPrograms": []}
         if did and did in deliveries:
             deliveries[did]["stoneIds"].append(sid)
 
     sawPrograms: Dict[str, dict] = {}
     for sp in obj.get("sawPrograms", []):
-        pid = str(sp["prog_id"]); sid = str(sp["stone_id"])
+        pid = str(sp["prog_id"])
+        sid = str(sp["stone_id"])
         sawPrograms[pid] = {
             "id": pid, "stoneId": sid,
             "load": int(sp.get("load_C_min", 0)),
@@ -186,7 +189,8 @@ def build_tasks(orders, deliveries, stones, sawPrograms, details):
             add_task(t_load, s["orderId"], sid, "Положить на пилу", (OP, SAW), sp["load"])
             add_task(t_proc, s["orderId"], sid, "Пила распил", (SAW,), sp["process"])
             add_task(t_unld, s["orderId"], sid, "Снять с пилы", (OP, SAW), sp["unload"])
-            link(t_load, t_proc); link(t_proc, t_unld)
+            link(t_load, t_proc)
+            link(t_proc, t_unld)
 
             # Доставка перед распилом
             did = s.get("deliveryId")
@@ -213,19 +217,24 @@ def build_tasks(orders, deliveries, stones, sawPrograms, details):
                     add_task(e1, s["orderId"], det_id, "Положить на кромку", (OP, EDGE_MACHINE), d["edge_load"])
                     add_task(e2, s["orderId"], det_id, "Кромка", (EDGE_MACHINE,), d["edge_process"])
                     add_task(e3, s["orderId"], det_id, "Снять с кромки", (OP, EDGE_MACHINE), d["edge_unload"])
-                    link(prev, e1); link(e1, e2); link(e2, e3)
+                    link(prev, e1)
+                    link(e1, e2)
+                    link(e2, e3)
                     prev = e3
 
                 # Фрезеровки (возможно на разных станках)
                 for ms in d["millingStages"]:
-                    mid = ms["id"]; mach = ms["machine"]
+                    mid = ms["id"]
+                    mach = ms["machine"]
                     m1 = f"T_MILL_LOAD_{mid}"
                     m2 = f"T_MILL_PROC_{mid}"
                     m3 = f"T_MILL_UNLOAD_{mid}"
                     add_task(m1, s["orderId"], det_id, f"Положить на {mach}", (OP, mach), ms["load"])
                     add_task(m2, s["orderId"], det_id, f"Фрезеровка ({mach})", (mach,), ms["process"])
                     add_task(m3, s["orderId"], det_id, f"Снять с {mach}", (OP, mach), ms["unload"])
-                    link(prev, m1); link(m1, m2); link(m2, m3)
+                    link(prev, m1)
+                    link(m1, m2)
+                    link(m2, m3)
                     prev = m3
 
     # Ресурсы и календари
@@ -371,11 +380,6 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
     # Также учтём доставки (OP).
     # Сгруппируем по машинам тройки.
     # Сначала создадим все элементарные переменные.
-    load_of: Dict[str, str] = {}   # proc_id -> load_id
-    unld_of: Dict[str, str] = {}   # proc_id -> unload_id
-    proc_of_load: Dict[str, str] = {}
-    unld_of_load: Dict[str, str] = {}
-    machine_of_load: Dict[str, str] = {}
 
     # Создание basic переменных для всех задач
     for uid, t in tasks_all.items():
@@ -674,9 +678,11 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
 
     # перенесём времена в tasks_all из финального решения
     for uid in tasks_all.keys():
-        s = sol.Value(starts[uid]); e = sol.Value(ends[uid])
-        tasks_all[uid].start = s; tasks_all[uid].end = e
-    
+        s = sol.Value(starts[uid])
+        e = sol.Value(ends[uid])
+        tasks_all[uid].start = s
+        tasks_all[uid].end = e
+
     # ФИЛЬТР: видимые перерывы — только те, что начинаются до makespan
     visible_breaks = [(s_beg, s_end, dur) for (s_beg, s_end, dur) in chosen_breaks if s_beg < makespan]
 
@@ -724,11 +730,13 @@ def schedule_cp(orders, deliveries, stones, sawPrograms, details, policy):
     for uid in sorted_uids:
         if uid in emitted:
             continue
-        view_order.append(uid); emitted.add(uid)
+        view_order.append(uid)
+        emitted.add(uid)
         if is_load_uid(uid):
             puid = paired_proc_uid(uid)
             if puid and puid not in emitted:
-                view_order.append(puid); emitted.add(puid)
+                view_order.append(puid)
+                emitted.add(puid)
     # добираем оставшиеся (UNLOAD, доставки, чужие операции) в хрон.порядке
     for uid in sorted_uids:
         if uid not in emitted:
@@ -850,13 +858,15 @@ def build_gantt_html(tasks_all: Dict[str, Task], resources, calendars, warnings=
     view_order = []
     emitted = set()
     for uid in sorted_uids:
-        if uid in emitted: 
+        if uid in emitted:
             continue
-        view_order.append(uid); emitted.add(uid)
+        view_order.append(uid)
+        emitted.add(uid)
         if is_load_uid(uid):
             puid = paired_proc_uid(uid)
             if puid and puid not in emitted:
-                view_order.append(puid); emitted.add(puid)
+                view_order.append(puid)
+                emitted.add(puid)
     for uid in sorted_uids:
         if uid not in emitted:
             view_order.append(uid); emitted.add(uid)
