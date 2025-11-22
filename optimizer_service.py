@@ -109,6 +109,7 @@ def _ensure_bootstrap_users():
         "password_hash": hash_password(AUTH_BOOTSTRAP_ADMIN_PASSWORD),
         "role": "admin",
         "is_active": True,
+        "must_change_password": True,   # ← новый флаг
         "created_at": dt.datetime.utcnow().isoformat() + "Z",
     }
     data = {"version": 1, "users": [admin_user]}
@@ -167,14 +168,25 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(auth_sc
     user = users.get(username)
     if not user or not user.get("is_active", True):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
+    return {
+        "username": username,
+        "role": role,
+        "must_change_password": bool(user.get("must_change_password", False)),
+    }
     return {"username": username, "role": role}
 
-def require_admin(user: dict = Depends(get_current_user)) -> dict:
+def require_active_user(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("must_change_password"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Password change required")
+    return user
+
+def require_admin(user: dict = Depends(require_active_user)) -> dict:
     if user["role"] != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
     return user
 
-# --------- Константы ресурсов и смен ---------
+ # --------- Константы ресурсов и смен ---------
 OP = "Оператор"
 SAW = "Пила"
 EDGE_MACHINE = "Кромка"
@@ -1210,11 +1222,13 @@ class LoginResponse(BaseModel):
     username: str
     role: str
     exp: int
+    must_change_password: bool = False
 
 class UserOut(BaseModel):
     username: str
     role: str
     is_active: bool
+    must_change_password: bool | None = None
     created_at: str | None = None
 
 class UserCreate(BaseModel):
@@ -1226,6 +1240,10 @@ class UserUpdate(BaseModel):
     password: str | None = None
     role: str | None = None
     is_active: bool | None = None
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str
 
 app.add_middleware(
     CORSMiddleware,
@@ -1309,6 +1327,7 @@ def login(req: LoginRequest):
         username=user["username"],
         role=user["role"],
         exp=exp,
+        must_change_password=bool(user.get("must_change_password", False)),
     )
 
 @app.get("/auth/me", response_model=UserOut)
@@ -1319,6 +1338,7 @@ def auth_me(user=Depends(get_current_user)):
         username=user["username"],
         role=user["role"],
         is_active=u.get("is_active", True),
+        must_change_password=u.get("must_change_password"),
         created_at=u.get("created_at"),
     )
 
@@ -1330,6 +1350,7 @@ def list_users(_: dict = Depends(require_admin)):
             username=u["username"],
             role=u.get("role", "user"),
             is_active=u.get("is_active", True),
+            must_change_password=u.get("must_change_password"),
             created_at=u.get("created_at"),
         )
         for u in users.values()
@@ -1349,6 +1370,7 @@ def create_user(payload: UserCreate, _: dict = Depends(require_admin)):
         "password_hash": hash_password(payload.password),
         "role": payload.role,
         "is_active": True,
+        "must_change_password": True,   # ← временный пароль, обязателен к смене
         "created_at": dt.datetime.utcnow().isoformat() + "Z",
     }
     _save_users(users)
@@ -1377,6 +1399,7 @@ def update_user(username: str, payload: UserUpdate, admin=Depends(require_admin)
 
     if payload.password:
         user["password_hash"] = hash_password(payload.password)
+        user["must_change_password"] = True  # ← при сбросе пароля заставляем сменить
     if payload.role:
         if payload.role not in ("admin", "user"):
             raise HTTPException(status_code=400, detail="Invalid role")
@@ -1409,3 +1432,31 @@ def delete_user(username: str, admin=Depends(require_admin)):
     del users[username]
     _save_users(users)
     return {"ok": True}
+
+@app.post("/auth/change-password", response_model=LoginResponse)
+def change_password(payload: PasswordChange, current=Depends(get_current_user)):
+    users = _load_users()
+    user = users.get(current["username"])
+    if not user or not user.get("is_active", True):
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    if not verify_password(payload.old_password, user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Wrong current password")
+
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password too short")
+
+    user["password_hash"] = hash_password(payload.new_password)
+    user["must_change_password"] = False
+    users[user["username"]] = user
+    _save_users(users)
+
+    token, exp = create_access_token(user["username"], user["role"])
+    return LoginResponse(
+        access_token=token,
+        token_type="bearer",
+        username=user["username"],
+        role=user["role"],
+        exp=exp,
+        must_change_password=False,
+    )
