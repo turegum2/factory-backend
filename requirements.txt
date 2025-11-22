@@ -5,3 +5,4 @@ openpyxl
 ortools
 aiofiles
 boto3
+PyJWT

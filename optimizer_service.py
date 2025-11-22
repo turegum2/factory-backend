@@ -22,8 +22,16 @@ import time
 import mimetypes
 import uuid
 import boto3
+import json
+import hmac
+import hashlib
+import base64
+import datetime as dt
+from botocore.exceptions import ClientError
+import jwt  # PyJWT
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 
@@ -35,9 +43,22 @@ from ortools.sat.python import cp_model
 # --------- Всякие S3 штуки -----------------
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "https://storage.yandexcloud.net")
 S3_REGION = os.getenv("S3_REGION", "ru-central1")
-S3_BUCKET = os.getenv("S3_BUCKET", "optimizer-ui")  # обязателен
-S3_PREFIX = os.getenv("S3_PREFIX", "prod/")  # можно пустым
+S3_BUCKET = os.getenv("S3_BUCKET", "optimizer-ui")
+S3_PREFIX = os.getenv("S3_PREFIX", "prod/")
 PRESIGN_TTL = int(os.getenv("S3_PRESIGN_TTL", "86400"))
+
+# --------- Доступ -----------------
+JWT_ALG = "HS256"
+JWT_TTL_MIN = int(os.getenv("JWT_TTL_MIN", "480"))
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET env var JWT_SECRET is not set")
+
+USERS_S3_KEY = os.getenv("USERS_S3_KEY", f"{S3_PREFIX}auth/users.json")
+AUTH_BOOTSTRAP_ADMIN_LOGIN = os.getenv("AUTH_BOOTSTRAP_ADMIN_LOGIN", "admin")
+AUTH_BOOTSTRAP_ADMIN_PASSWORD = os.getenv("AUTH_BOOTSTRAP_ADMIN_PASSWORD", "admin")
+
+auth_scheme = HTTPBearer(auto_error=False)
 
 _s3 = boto3.client(
     "s3",
@@ -56,6 +77,102 @@ def _s3_presigned(key: str, filename: str | None = None) -> str:
     if filename:
         params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
     return _s3.generate_presigned_url("get_object", Params=params, ExpiresIn=PRESIGN_TTL)
+
+# --------- Хелперы для работы с доступами и паролями ---------
+def hash_password(password: str, iterations: int = 100_000) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"{iterations}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        iterations_str, salt_b64, hash_b64 = stored.split("$", 2)
+        iterations = int(iterations_str)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+    except Exception:
+        return False
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(dk, expected)
+
+def _ensure_bootstrap_users():
+    """Если файла пользователей нет — создать с одним админом."""
+    try:
+        _s3.head_object(Bucket=S3_BUCKET, Key=USERS_S3_KEY)
+        return
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+
+    admin_user = {
+        "username": AUTH_BOOTSTRAP_ADMIN_LOGIN,
+        "password_hash": hash_password(AUTH_BOOTSTRAP_ADMIN_PASSWORD),
+        "role": "admin",
+        "is_active": True,
+        "created_at": dt.datetime.utcnow().isoformat() + "Z",
+    }
+    data = {"version": 1, "users": [admin_user]}
+    _s3_put(USERS_S3_KEY, json.dumps(data).encode("utf-8"), "application/json")
+
+
+def _load_users() -> dict[str, dict]:
+    _ensure_bootstrap_users()
+    try:
+        obj = _s3.get_object(Bucket=S3_BUCKET, Key=USERS_S3_KEY)
+        raw = obj["Body"].read().decode("utf-8")
+        payload = json.loads(raw) or {}
+        users_list = payload.get("users", [])
+        return {u["username"]: u for u in users_list}
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            return {}
+        raise
+
+def _save_users(users: dict[str, dict]):
+    data = {
+        "version": 1,
+        "users": list(users.values()),
+    }
+    _s3_put(USERS_S3_KEY, json.dumps(data).encode("utf-8"), "application/json")
+
+def create_access_token(username: str, role: str) -> tuple[str, int]:
+    now = int(time.time())
+    exp = now + JWT_TTL_MIN * 60
+    payload = {
+        "sub": username,
+        "role": role,
+        "iat": now,
+        "exp": exp,
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+    return token, exp
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)) -> dict:
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    username = payload.get("sub")
+    role = payload.get("role")
+    if not username or not role:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+
+    users = _load_users()
+    user = users.get(username)
+    if not user or not user.get("is_active", True):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
+    return {"username": username, "role": role}
+
+def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+    return user
 
 # --------- Константы ресурсов и смен ---------
 OP = "Оператор"
@@ -1081,6 +1198,35 @@ app = FastAPI(title="Production Optimizer (CP-SAT)", version="2.0.0")
 
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
 
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    username: str
+    role: str
+    exp: int
+
+class UserOut(BaseModel):
+    username: str
+    role: str
+    is_active: bool
+    created_at: str | None = None
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+class UserUpdate(BaseModel):
+    password: str | None = None
+    role: str | None = None
+    is_active: bool | None = None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # сузить в проде
@@ -1098,21 +1244,21 @@ def schedule(orders, deliveries, stones, sawPrograms, details, policy):
     return schedule_cp(orders, deliveries, stones, sawPrograms, details, policy)
 
 @app.post("/optimize")
-def optimize(payload: dict = Body(...)):
+def optimize(payload: dict = Body(...), user=Depends(get_current_user)):
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(orders, deliveries, stones, sawPrograms, details, policy)
     result = {"schedule": df.to_dict(orient="records"), "metrics": metrics, "warnings": warnings}
     return JSONResponse(result)
 
 @app.post("/optimize/html")
-def optimize_html(payload: dict = Body(...)):
+def optimize_html(payload: dict = Body(...), user=Depends(get_current_user)):
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(orders, deliveries, stones, sawPrograms, details, policy)
     html = build_gantt_html(tasks_all, resources, calendars, warnings, breaks=chosen_breaks)
     return HTMLResponse(html)
 
 @app.post("/optimize/html-file")
-def optimize_html_file(payload: dict = Body(...)):
+def optimize_html_file(payload: dict = Body(...), user=Depends(get_current_user)):
     # 1) расчет
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(
@@ -1146,3 +1292,120 @@ def optimize_html_file(payload: dict = Body(...)):
 
     # 5) отдаем ссылки (html_html оставляем для дебага/резерва)
     return JSONResponse({"ok": True, "html_url": html_url, "excel_url": excel_url, "html": html})
+
+@app.post("/auth/login", response_model=LoginResponse)
+def login(req: LoginRequest):
+    users = _load_users()
+    user = users.get(req.username)
+    if not user or not user.get("is_active", True):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token, exp = create_access_token(user["username"], user["role"])
+    return LoginResponse(
+        access_token=token,
+        token_type="bearer",
+        username=user["username"],
+        role=user["role"],
+        exp=exp,
+    )
+
+@app.get("/auth/me", response_model=UserOut)
+def auth_me(user=Depends(get_current_user)):
+    users = _load_users()
+    u = users.get(user["username"], {})
+    return UserOut(
+        username=user["username"],
+        role=user["role"],
+        is_active=u.get("is_active", True),
+        created_at=u.get("created_at"),
+    )
+
+@app.get("/users", response_model=list[UserOut])
+def list_users(_: dict = Depends(require_admin)):
+    users = _load_users()
+    return [
+        UserOut(
+            username=u["username"],
+            role=u.get("role", "user"),
+            is_active=u.get("is_active", True),
+            created_at=u.get("created_at"),
+        )
+        for u in users.values()
+    ]
+
+@app.post("/users", response_model=UserOut)
+def create_user(payload: UserCreate, _: dict = Depends(require_admin)):
+    users = _load_users()
+    if payload.username in users:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    if payload.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    users[payload.username] = {
+        "username": payload.username,
+        "password_hash": hash_password(payload.password),
+        "role": payload.role,
+        "is_active": True,
+        "created_at": dt.datetime.utcnow().isoformat() + "Z",
+    }
+    _save_users(users)
+    return UserOut(
+        username=payload.username,
+        role=payload.role,
+        is_active=True,
+        created_at=users[payload.username]["created_at"],
+    )
+
+@app.put("/users/{username}", response_model=UserOut)
+def update_user(username: str, payload: UserUpdate, admin=Depends(require_admin)):
+    users = _load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = users[username]
+
+    # Защита от потери последнего админа
+    if payload.role == "user" or payload.is_active is False:
+        if user["role"] == "admin":
+            other_admins = [u for u in users.values()
+                            if u["username"] != username and u["role"] == "admin" and u.get("is_active", True)]
+            if not other_admins:
+                raise HTTPException(status_code=400, detail="Cannot demote/disable last admin")
+
+    if payload.password:
+        user["password_hash"] = hash_password(payload.password)
+    if payload.role:
+        if payload.role not in ("admin", "user"):
+            raise HTTPException(status_code=400, detail="Invalid role")
+        user["role"] = payload.role
+    if payload.is_active is not None:
+        user["is_active"] = payload.is_active
+
+    users[username] = user
+    _save_users(users)
+    return UserOut(
+        username=user["username"],
+        role=user["role"],
+        is_active=user.get("is_active", True),
+        created_at=user.get("created_at"),
+    )
+
+@app.delete("/users/{username}")
+def delete_user(username: str, admin=Depends(require_admin)):
+    users = _load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = users[username]
+    if user["role"] == "admin":
+        other_admins = [u for u in users.values()
+                        if u["username"] != username and u["role"] == "admin" and u.get("is_active", True)]
+        if not other_admins:
+            raise HTTPException(status_code=400, detail="Cannot delete last admin")
+
+    del users[username]
+    _save_users(users)
+    return {"ok": True}
