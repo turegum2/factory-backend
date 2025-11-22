@@ -1262,21 +1262,21 @@ def schedule(orders, deliveries, stones, sawPrograms, details, policy):
     return schedule_cp(orders, deliveries, stones, sawPrograms, details, policy)
 
 @app.post("/optimize")
-def optimize(payload: dict = Body(...), user=Depends(get_current_user)):
+def optimize(payload: dict = Body(...), user=Depends(require_active_user)):
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(orders, deliveries, stones, sawPrograms, details, policy)
     result = {"schedule": df.to_dict(orient="records"), "metrics": metrics, "warnings": warnings}
     return JSONResponse(result)
 
 @app.post("/optimize/html")
-def optimize_html(payload: dict = Body(...), user=Depends(get_current_user)):
+def optimize_html(payload: dict = Body(...), user=Depends(require_active_user)):
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(orders, deliveries, stones, sawPrograms, details, policy)
     html = build_gantt_html(tasks_all, resources, calendars, warnings, breaks=chosen_breaks)
     return HTMLResponse(html)
 
 @app.post("/optimize/html-file")
-def optimize_html_file(payload: dict = Body(...), user=Depends(get_current_user)):
+def optimize_html_file(payload: dict = Body(...), user=Depends(require_active_user)):
     # 1) расчет
     orders, deliveries, stones, sawPrograms, details, policy = build_runtime(payload)
     df, metrics, tasks_all, resources, calendars, warnings, chosen_breaks = schedule(
