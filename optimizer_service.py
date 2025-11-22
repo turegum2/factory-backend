@@ -100,10 +100,12 @@ def _ensure_bootstrap_users():
     """Если файла пользователей нет — создать с одним админом."""
     try:
         _s3.head_object(Bucket=S3_BUCKET, Key=USERS_S3_KEY)
+        print(f"[auth] users file exists at s3://{S3_BUCKET}/{USERS_S3_KEY}")
         return
     except ClientError as e:
         if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
             raise
+    print(f"[auth] users file NOT found, bootstrapping admin at s3://{S3_BUCKET}/{USERS_S3_KEY}")
 
     admin_user = {
         "username": AUTH_BOOTSTRAP_ADMIN_LOGIN,
