@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - "optimizer_service.py"
+      - "grafics.py"
       - "requirements.txt"
       - "Dockerfile"
       - ".github/workflows/deploy-back.yml"
