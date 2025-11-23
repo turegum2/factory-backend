@@ -30,8 +30,11 @@ import base64
 import datetime as dt
 from botocore.exceptions import ClientError
 import jwt  # PyJWT
+import tempfile
 
-from fastapi import FastAPI, Body, Depends, HTTPException, status
+from grafics import analyze_cutting_sheet
+
+from fastapi import FastAPI, Body, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -1262,6 +1265,50 @@ def ping():
 def schedule(orders, deliveries, stones, sawPrograms, details, policy):
     """Совместимость со старым API — теперь вызывает CP-SAT оптимизатор."""
     return schedule_cp(orders, deliveries, stones, sawPrograms, details, policy)
+
+@app.get("/grafics/ping")
+def grafics_ping(user=Depends(require_admin)):
+    return {"status": "ok"}
+
+
+@app.post("/grafics/analyze")
+async def grafics_analyze(
+    file: UploadFile = File(...),
+    user=Depends(require_admin),
+):
+    """
+    Анализ карты раскроя в DXF:
+    - Кромка: параметр + длины
+    - Подворот: параметр + длины
+    - ТС / ЦС: итоговая длина (по группе)
+    Доступ только админу.
+    """
+    if not file.filename.lower().endswith(".dxf"):
+        raise HTTPException(status_code=400, detail="Ожидается файл .dxf")
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        result = analyze_cutting_sheet(tmp_path)
+
+        # Нормализуем под фронт: если пустой список, возвращаем None
+        payload = {
+            "kromka_param": result["kromka"]["param"],
+            "kromka_lengths": result["kromka"]["lengths"],
+            "podvorot_param": result["podvorot"]["param"],
+            "podvorot_lengths": result["podvorot"]["lengths"],
+            "ts": result["ts"][0] if result["ts"] else None,
+            "cs": result["cs"][0] if result["cs"] else None,
+        }
+
+        return JSONResponse(payload)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 @app.post("/optimize")
 def optimize(payload: dict = Body(...), user=Depends(require_active_user)):

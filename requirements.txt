@@ -6,3 +6,5 @@ ortools
 aiofiles
 boto3
 PyJWT
+ezdxf
+python-multipart
